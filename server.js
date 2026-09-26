@@ -15,121 +15,128 @@ const { convertToOgg, generateTexture } = require('./processing');
 const { forLang } = require('./i18n');
 
 const app = express();
+// Render (і більшість хостингів) стоїть за проксі — без цього express-rate-limit
+// не може коректно визначити IP клієнта і кидає ValidationError в логи.
+app.set('trust proxy', 1);
+
 app.use(helmet());
 app.use(cors({ origin: config.frontendOrigin }));
 app.use(express.json({ limit: '200kb' }));
 
-const buildLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.max });
+const submitLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.max });
 
-// ---- Тимчасова папка для однієї сесії/збірки ----
-function makeSessionDir() {
-  const dir = path.join(os.tmpdir(), 'msc-session-' + crypto.randomUUID());
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
-}
-
-async function cleanup(dir) {
-  try { await fsp.rm(dir, { recursive: true, force: true }); } catch (_) { /* не критично */ }
-}
-
-// ---- Multer: приймаємо файли на диск у сесійну теку з випадковими іменами ----
-const upload = multer({
-  storage: multer.memoryStorage(), // невеликі аудіо для MVP тримаємо в пам'яті, пишемо на диск самі нижче
-  limits: {
-    fileSize: config.limits.maxFileSizeMb * 1024 * 1024,
-    files: config.limits.premiumMaxFiles,
-  },
-  fileFilter: (req, file, cb) => {
-    const ext = path.extname(file.originalname).slice(1).toLowerCase();
-    if (!config.limits.allowedExt.includes(ext)) {
-      return cb(new Error(`Формат .${ext} не підтримується`));
-    }
-    cb(null, true);
-  },
-});
-
-function isPremium(req) {
-  if (!config.premiumKey) return false; // якщо ключ не налаштований на сервері — Premium вимкнено для всіх
-  const key = req.header('X-Premium-Key');
-  return Boolean(key) && key === config.premiumKey;
+function isPremiumKey(key) {
+  return Boolean(config.premiumKey) && Boolean(key) && key === config.premiumKey;
 }
 
 function sanitizeName(name) {
-  // Прибираємо все, крім звичайних символів — назва йде тільки в текст README/текстур, не у файлову систему.
   return String(name || 'Untitled').replace(/[\r\n\t]/g, ' ').slice(0, 80);
 }
 
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+// =========================================================================
+// ЧЕРГА: сервер слабкий (Free-тариф Render ~0.1 CPU), тож обробляємо
+// РІВНО ОДИН пакет за раз для всіх користувачів одразу. Інші чекають і
+// бачать свою позицію в черзі, замість того щоб усі одночасно вантажили CPU
+// і отримували таймаути.
+// =========================================================================
+const jobs = new Map(); // jobId -> job object
+const queue = []; // масив jobId у порядку FIFO (ще не почались)
+let current = null; // job, який обробляється прямо зараз
+let processingLoopRunning = false;
 
-app.post('/api/build', buildLimiter, upload.array('files'), async (req, res) => {
-  const sessionDir = makeSessionDir();
+function getPosition(job) {
+  if (current && current.id === job.id) return 0;
+  const idx = queue.indexOf(job.id);
+  return idx === -1 ? 0 : idx + 1;
+}
+
+function publicStatus(job) {
+  return { id: job.id, status: job.status, position: getPosition(job), error: job.error || null };
+}
+
+async function cleanupJob(job) {
+  jobs.delete(job.id);
+  try { await fsp.rm(job.dir, { recursive: true, force: true }); } catch (_) { /* не критично */ }
+}
+
+// Прибирання «покинутих» завершених завдань, які ніхто так і не завантажив.
+setInterval(() => {
+  const ttlMs = 20 * 60 * 1000;
+  const now = Date.now();
+  for (const job of jobs.values()) {
+    if ((job.status === 'done' || job.status === 'error') && now - job.finishedAt > ttlMs) {
+      cleanupJob(job);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
+async function pump() {
+  if (processingLoopRunning) return;
+  const nextId = queue.shift();
+  if (!nextId) return;
+  processingLoopRunning = true;
+  const job = jobs.get(nextId);
+  current = job;
+  job.status = 'processing';
   try {
-    const premium = isPremium(req);
-    const files = req.files || [];
-    const maxFiles = premium ? config.limits.premiumMaxFiles : config.limits.freeMaxFiles;
+    await runJob(job);
+    job.status = 'done';
+  } catch (err) {
+    console.error('job failed:', job.id, err.message);
+    job.status = 'error';
+    job.error = friendlyError(err.message);
+  } finally {
+    job.finishedAt = Date.now();
+    current = null;
+    processingLoopRunning = false;
+    pump();
+  }
+}
 
-    if (files.length === 0) {
-      return res.status(400).json({ error: 'Немає файлів для обробки' });
-    }
-    if (files.length > maxFiles) {
-      return res.status(400).json({ error: `Ліміт файлів: ${maxFiles}${premium ? '' : ' на Free'}` });
-    }
+function friendlyError(msg) {
+  if (msg && msg.includes('ffmpeg timeout')) {
+    return 'Обробка зайняла надто багато часу (слабкий сервер). Спробуй менше файлів або простіший ефект.';
+  }
+  return 'Не вдалося зібрати пакет. Спробуй ще раз.';
+}
 
-    // Порядок файлів = порядок масиву (фронтенд вже надсилає у фінальному порядку треків).
-    let titles = [];
-    try { titles = JSON.parse(req.body.titles || '[]'); } catch (_) { titles = []; }
+// Власне обробка одного завдання: конвертація, текстура, README/TRACKLIST, ZIP на диск.
+async function runJob(job) {
+  const { files, mode, lang, effectivePreset, wantTexture, titles } = job.params;
+  const uploadsDir = job.dir; // файли вже лежать тут (записані одразу при прийомі)
+  const outDir = path.join(job.dir, 'out');
+  await fsp.mkdir(outDir, { recursive: true });
 
-    const mode = req.body.mode === 'radio' ? 'radio' : 'music';
-    const lang = ['uk', 'en', 'fi', 'pl', 'de', 'ru'].includes(req.body.lang) ? req.body.lang : 'uk';
-    const requestedPreset = req.body.processing || 'none';
-    const preset = config.presets[requestedPreset] ? requestedPreset : 'none';
-    const presetDef = config.presets[preset];
+  const trackNames = new Array(files.length);
+  const oggPaths = new Array(files.length);
 
-    // Сервер сам вирішує, чи дозволена обробка — фронтенду тут не довіряємо.
-    const effectivePreset = presetDef.premium && !premium ? 'none' : preset;
-    const wantTexture = req.body.generateTexture === 'true' && mode === 'music' && premium;
+  async function processOne(i) {
+    const f = files[i];
+    const outPath = path.join(outDir, `track${i + 1}.ogg`);
+    await convertToOgg(f.path, outPath, config.presets[effectivePreset].filter);
+    oggPaths[i] = outPath;
+    trackNames[i] = sanitizeName(titles[i] || f.baseName);
+  }
 
-    const uploadsDir = path.join(sessionDir, 'uploads');
-    const outDir = path.join(sessionDir, 'out');
-    await fsp.mkdir(uploadsDir, { recursive: true });
-    await fsp.mkdir(outDir, { recursive: true });
+  const concurrency = config.limits.ffmpegConcurrency;
+  for (let start = 0; start < files.length; start += concurrency) {
+    const batch = [];
+    for (let i = start; i < Math.min(start + concurrency, files.length); i++) batch.push(processOne(i));
+    await Promise.all(batch);
+  }
 
-    const trackNames = new Array(files.length);
-    const oggPaths = new Array(files.length);
+  const readmeName = mode === 'radio' ? 'README_RADIO.txt' : 'README.txt';
+  const readme = buildReadme(mode, trackNames, effectivePreset, wantTexture, lang);
+  const tracklist = buildTracklist(trackNames, lang);
 
-    async function processOne(i) {
-      const file = files[i];
-      if (file.size === 0) throw new Error(`Файл ${file.originalname} порожній`);
-      const inPath = path.join(uploadsDir, `in_${i}${path.extname(file.originalname)}`);
-      await fsp.writeFile(inPath, file.buffer);
-
-      const outPath = path.join(outDir, `track${i + 1}.ogg`);
-      await convertToOgg(inPath, outPath, config.presets[effectivePreset].filter);
-      oggPaths[i] = outPath;
-      trackNames[i] = sanitizeName(titles[i] || path.basename(file.originalname, path.extname(file.originalname)));
-    }
-
-    // Обробляємо кількома файлами паралельно (не всі одразу) — на слабкому CPU (Free-тариф Render)
-    // виграш може бути невеликим, але на потужнішому плані це відчутно швидше.
-    const concurrency = config.limits.ffmpegConcurrency;
-    for (let start = 0; start < files.length; start += concurrency) {
-      const batch = [];
-      for (let i = start; i < Math.min(start + concurrency, files.length); i++) batch.push(processOne(i));
-      await Promise.all(batch);
-    }
-
-    // ---- README + TRACKLIST (два окремих файли, локалізовані) ----
-    const readmeName = mode === 'radio' ? 'README_RADIO.txt' : 'README.txt';
-    const readme = buildReadme(mode, trackNames, effectivePreset, wantTexture, lang);
-    const tracklist = buildTracklist(trackNames, lang);
-
-    // ---- ZIP стрімінгом одразу у відповідь ----
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="MSC_Music_Pack.zip"');
-
+  const zipPath = path.join(job.dir, 'pack.zip');
+  await new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(zipPath);
     const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('error', (err) => { throw err; });
-    archive.pipe(res);
+    archive.on('error', reject);
+    out.on('close', resolve);
+    out.on('error', reject);
+    archive.pipe(out);
 
     const folderName = mode === 'radio' ? 'Radio' : 'Music';
     oggPaths.forEach((p, i) => archive.file(p, { name: `${folderName}/track${i + 1}.ogg` }));
@@ -137,18 +144,19 @@ app.post('/api/build', buildLimiter, upload.array('files'), async (req, res) => 
     archive.append(tracklist, { name: 'TRACKLIST.txt' });
 
     if (wantTexture) {
-      const texture = await generateTexture(trackNames, lang);
-      archive.append(texture, { name: 'Textures/texture.png' });
+      generateTexture(trackNames, lang)
+        .then((texture) => {
+          archive.append(texture, { name: 'Textures/texture.png' });
+          archive.finalize();
+        })
+        .catch(reject);
+    } else {
+      archive.finalize();
     }
+  });
 
-    await archive.finalize();
-  } catch (err) {
-    console.error('build error:', err.message);
-    if (!res.headersSent) res.status(500).json({ error: 'Не вдалося зібрати пакет. Спробуйте ще раз.' });
-  } finally {
-    cleanup(sessionDir);
-  }
-});
+  job.zipPath = zipPath;
+}
 
 function buildReadme(mode, trackNames, preset, hasTextures, lang) {
   const s = forLang(lang);
@@ -164,5 +172,118 @@ function buildTracklist(trackNames, lang) {
   trackNames.forEach((name, i) => lines.push(`${String(i + 1).padStart(2, '0')}. ${name}`));
   return lines.join('\n');
 }
+
+// =========================================================================
+// Multer: приймаємо файли в тимчасову теку одразу на диск (щоб не тримати
+// в пам'яті, поки завдання чекає своєї черги).
+// =========================================================================
+function makeJobDir(jobId) {
+  const dir = path.join(os.tmpdir(), 'msc-job-' + jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: config.limits.maxFileSizeMb * 1024 * 1024,
+    files: config.limits.premiumMaxFiles,
+  },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname).slice(1).toLowerCase();
+    if (!config.limits.allowedExt.includes(ext)) return cb(new Error(`Формат .${ext} не підтримується`));
+    cb(null, true);
+  },
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// Дозволяє фронтенду перевірити ключ ДО збірки — щоб чесно показати "Premium увімкнено",
+// а не просто повірити тому, що ввів користувач.
+app.post('/api/verify-key', (req, res) => {
+  const key = (req.body && req.body.key) || '';
+  res.json({ valid: isPremiumKey(key) });
+});
+
+app.post('/api/jobs', submitLimiter, upload.array('files'), async (req, res) => {
+  try {
+    const premiumKeyHeader = req.header('X-Premium-Key') || '';
+    const premium = isPremiumKey(premiumKeyHeader);
+    const files = req.files || [];
+    const maxFiles = premium ? config.limits.premiumMaxFiles : config.limits.freeMaxFiles;
+
+    if (files.length === 0) return res.status(400).json({ error: 'Немає файлів для обробки' });
+    if (files.length > maxFiles) {
+      return res.status(400).json({ error: `Ліміт файлів: ${maxFiles}${premium ? '' : ' на Free'}` });
+    }
+
+    const queueLoad = queue.length + (current ? 1 : 0);
+    if (queueLoad >= config.limits.maxQueueSize) {
+      return res.status(429).json({ error: 'Сервер зараз перевантажений — забагато людей у черзі. Спробуй за кілька хвилин.' });
+    }
+
+    let titles = [];
+    try { titles = JSON.parse(req.body.titles || '[]'); } catch (_) { titles = []; }
+
+    const mode = req.body.mode === 'radio' ? 'radio' : 'music';
+    const lang = ['uk', 'en', 'fi', 'pl', 'de', 'ru'].includes(req.body.lang) ? req.body.lang : 'uk';
+    const requestedPreset = req.body.processing || 'none';
+    const preset = config.presets[requestedPreset] ? requestedPreset : 'none';
+    const presetDef = config.presets[preset];
+    const effectivePreset = presetDef.premium && !premium ? 'none' : preset;
+    const wantTexture = req.body.generateTexture === 'true' && mode === 'music' && premium;
+
+    const jobId = crypto.randomUUID();
+    const dir = makeJobDir(jobId);
+
+    // Пишемо файли на диск одразу — це звільняє пам'ять і дозволяє завданню
+    // спокійно чекати в черзі, скільки потрібно.
+    const savedFiles = [];
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i];
+      if (f.size === 0) return res.status(400).json({ error: `Файл ${f.originalname} порожній` });
+      const filePath = path.join(dir, `in_${i}${path.extname(f.originalname)}`);
+      await fsp.writeFile(filePath, f.buffer);
+      savedFiles.push({ path: filePath, baseName: path.basename(f.originalname, path.extname(f.originalname)) });
+    }
+
+    const job = {
+      id: jobId,
+      dir,
+      status: 'queued',
+      error: null,
+      zipPath: null,
+      createdAt: Date.now(),
+      finishedAt: null,
+      params: { files: savedFiles, mode, lang, effectivePreset, wantTexture, titles },
+    };
+    jobs.set(jobId, job);
+    queue.push(jobId);
+
+    pump();
+    res.json(publicStatus(job));
+  } catch (err) {
+    console.error('job create error:', err.message);
+    res.status(500).json({ error: 'Не вдалося прийняти файли. Спробуй ще раз.' });
+  }
+});
+
+app.get('/api/jobs/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.status(404).json({ error: 'Завдання не знайдено (можливо, вже застаріло)' });
+  res.json(publicStatus(job));
+});
+
+app.get('/api/jobs/:id/download', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job || job.status !== 'done' || !job.zipPath) {
+    return res.status(400).json({ error: 'Пакет ще не готовий' });
+  }
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="MSC_Music_Pack.zip"');
+  const stream = fs.createReadStream(job.zipPath);
+  stream.pipe(res);
+  stream.on('close', () => cleanupJob(job));
+});
 
 app.listen(config.port, () => console.log(`MSC backend running on port ${config.port}`));
