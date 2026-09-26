@@ -94,10 +94,10 @@ app.post('/api/build', buildLimiter, upload.array('files'), async (req, res) => 
     await fsp.mkdir(uploadsDir, { recursive: true });
     await fsp.mkdir(outDir, { recursive: true });
 
-    const trackNames = [];
-    const oggPaths = [];
+    const trackNames = new Array(files.length);
+    const oggPaths = new Array(files.length);
 
-    for (let i = 0; i < files.length; i++) {
+    async function processOne(i) {
       const file = files[i];
       if (file.size === 0) throw new Error(`Файл ${file.originalname} порожній`);
       const inPath = path.join(uploadsDir, `in_${i}${path.extname(file.originalname)}`);
@@ -105,10 +105,17 @@ app.post('/api/build', buildLimiter, upload.array('files'), async (req, res) => 
 
       const outPath = path.join(outDir, `track${i + 1}.ogg`);
       await convertToOgg(inPath, outPath, config.presets[effectivePreset].filter);
-      oggPaths.push(outPath);
+      oggPaths[i] = outPath;
+      trackNames[i] = sanitizeName(titles[i] || path.basename(file.originalname, path.extname(file.originalname)));
+    }
 
-      const title = sanitizeName(titles[i] || path.basename(file.originalname, path.extname(file.originalname)));
-      trackNames.push(title);
+    // Обробляємо кількома файлами паралельно (не всі одразу) — на слабкому CPU (Free-тариф Render)
+    // виграш може бути невеликим, але на потужнішому плані це відчутно швидше.
+    const concurrency = config.limits.ffmpegConcurrency;
+    for (let start = 0; start < files.length; start += concurrency) {
+      const batch = [];
+      for (let i = start; i < Math.min(start + concurrency, files.length); i++) batch.push(processOne(i));
+      await Promise.all(batch);
     }
 
     // ---- README + TRACKLIST (два окремих файли, локалізовані) ----
