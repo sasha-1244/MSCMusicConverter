@@ -15,6 +15,7 @@ module.exports = {
     maxFileSizeMb: 60,
     allowedExt: ['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg'],
     ffmpegTimeoutMs: 60_000, // ліміт на конвертацію одного файлу
+    ffmpegConcurrency: 3, // скільки треків конвертувати одночасно (не всі відразу, щоб не покласти CPU/RAM)
   },
 
   // Налаштування кодування .ogg (Vorbis). q:a 0-10, більше = краща якість/більший файл.
