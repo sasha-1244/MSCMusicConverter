@@ -24,6 +24,12 @@ app.use(cors({ origin: config.frontendOrigin }));
 app.use(express.json({ limit: '200kb' }));
 
 const submitLimiter = rateLimit({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.max });
+// Окремий суворий ліміт на перевірку ключа — щоб короткий ключ не можна було підібрати перебором.
+const verifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  handler: (req, res) => res.status(429).json({ valid: false, error: 'Забагато спроб. Спробуй за кілька хвилин.' }),
+});
 
 function isPremiumKey(key) {
   return Boolean(config.premiumKey) && Boolean(key) && key === config.premiumKey;
@@ -201,7 +207,7 @@ app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // Дозволяє фронтенду перевірити ключ ДО збірки — щоб чесно показати "Premium увімкнено",
 // а не просто повірити тому, що ввів користувач.
-app.post('/api/verify-key', (req, res) => {
+app.post('/api/verify-key', verifyLimiter, (req, res) => {
   const key = (req.body && req.body.key) || '';
   res.json({ valid: isPremiumKey(key) });
 });
