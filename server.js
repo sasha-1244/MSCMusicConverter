@@ -78,23 +78,34 @@ setInterval(() => {
 
 async function pump() {
   if (processingLoopRunning) return;
-  const nextId = queue.shift();
-  if (!nextId) return;
+  let job = null;
+  while (queue.length) {
+    const candidate = jobs.get(queue.shift());
+    if (!candidate || candidate.cancelled) continue;
+    // Людина закрила вкладку, поки стояла в черзі (давно не опитувала статус) — не витрачаємо на неї CPU.
+    if (Date.now() - candidate.lastSeen > config.limits.abandonedQueueMs) { cleanupJob(candidate); continue; }
+    job = candidate; break;
+  }
+  if (!job) return;
   processingLoopRunning = true;
-  const job = jobs.get(nextId);
   current = job;
   job.status = 'processing';
   try {
     await runJob(job);
     job.status = 'done';
   } catch (err) {
-    console.error('job failed:', job.id, err.message);
-    job.status = 'error';
-    job.error = friendlyError(err.message);
+    if (job.cancelled) {
+      job.status = 'error';
+    } else {
+      console.error('job failed:', job.id, err.message);
+      job.status = 'error';
+      job.error = friendlyError(err.message);
+    }
   } finally {
     job.finishedAt = Date.now();
     current = null;
     processingLoopRunning = false;
+    if (job.cancelled) cleanupJob(job);
     pump();
   }
 }
@@ -117,6 +128,7 @@ async function runJob(job) {
   const oggPaths = new Array(files.length);
 
   async function processOne(i) {
+    if (job.cancelled) throw new Error('cancelled');
     const f = files[i];
     const outPath = path.join(outDir, `track${i + 1}.ogg`);
     await convertToOgg(f.path, outPath, config.presets[effectivePreset].filter);
@@ -190,8 +202,15 @@ function makeJobDir(jobId) {
   return dir;
 }
 
+// Файли пишемо одразу на диск (а не тримаємо в пам'яті): Free-тариф Render має лише 512 МБ RAM.
+const incomingDir = path.join(os.tmpdir(), 'msc-incoming');
+fs.mkdirSync(incomingDir, { recursive: true });
+
 const upload = multer({
-  storage: multer.memoryStorage(),
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, incomingDir),
+    filename: (req, file, cb) => cb(null, crypto.randomUUID() + path.extname(file.originalname).toLowerCase()),
+  }),
   limits: {
     fileSize: config.limits.maxFileSizeMb * 1024 * 1024,
     files: config.limits.premiumMaxFiles,
@@ -203,6 +222,33 @@ const upload = multer({
   },
 });
 
+// Обгортка, щоб помилки multer (завеликий файл, поганий формат) повертались як JSON, а не HTML.
+function receiveFiles(req, res, next) {
+  upload.array('files')(req, res, (err) => {
+    if (!err) return next();
+    const msg = err.code === 'LIMIT_FILE_SIZE'
+      ? `Файл завеликий (максимум ${config.limits.maxFileSizeMb} МБ)`
+      : (err.code === 'LIMIT_FILE_COUNT' ? 'Забагато файлів' : err.message);
+    res.status(400).json({ error: msg });
+  });
+}
+
+async function discardFiles(files) {
+  await Promise.all((files || []).map((f) => fsp.rm(f.path, { force: true }).catch(() => {})));
+}
+
+// Прибираємо недозавантажені файли (клієнт закрив вкладку посеред завантаження).
+setInterval(async () => {
+  try {
+    const now = Date.now();
+    for (const name of await fsp.readdir(incomingDir)) {
+      const full = path.join(incomingDir, name);
+      const st = await fsp.stat(full).catch(() => null);
+      if (st && now - st.mtimeMs > 30 * 60 * 1000) await fsp.rm(full, { force: true });
+    }
+  } catch (_) { /* не критично */ }
+}, 10 * 60 * 1000).unref();
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 // Дозволяє фронтенду перевірити ключ ДО збірки — щоб чесно показати "Premium увімкнено",
@@ -212,14 +258,19 @@ app.post('/api/verify-key', verifyLimiter, (req, res) => {
   res.json({ valid: isPremiumKey(key) });
 });
 
-app.post('/api/jobs', submitLimiter, upload.array('files'), async (req, res) => {
+app.post('/api/jobs', submitLimiter, receiveFiles, async (req, res) => {
+  const files = req.files || [];
+  let accepted = false;
   try {
     const premiumKeyHeader = req.header('X-Premium-Key') || '';
     const premium = isPremiumKey(premiumKeyHeader);
-    const files = req.files || [];
     const maxFiles = premium ? config.limits.premiumMaxFiles : config.limits.freeMaxFiles;
 
     if (files.length === 0) return res.status(400).json({ error: 'Немає файлів для обробки' });
+    const totalMb = files.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
+    if (totalMb > config.limits.maxTotalMb) {
+      return res.status(400).json({ error: `Загальний розмір файлів завеликий (максимум ${config.limits.maxTotalMb} МБ)` });
+    }
     if (files.length > maxFiles) {
       return res.status(400).json({ error: `Ліміт файлів: ${maxFiles}${premium ? '' : ' на Free'}` });
     }
@@ -243,16 +294,16 @@ app.post('/api/jobs', submitLimiter, upload.array('files'), async (req, res) => 
     const jobId = crypto.randomUUID();
     const dir = makeJobDir(jobId);
 
-    // Пишемо файли на диск одразу — це звільняє пам'ять і дозволяє завданню
-    // спокійно чекати в черзі, скільки потрібно.
+    // Переносимо вже завантажені файли в теку завдання — вони спокійно чекатимуть у черзі.
     const savedFiles = [];
     for (let i = 0; i < files.length; i++) {
       const f = files[i];
       if (f.size === 0) return res.status(400).json({ error: `Файл ${f.originalname} порожній` });
-      const filePath = path.join(dir, `in_${i}${path.extname(f.originalname)}`);
-      await fsp.writeFile(filePath, f.buffer);
+      const filePath = path.join(dir, `in_${i}${path.extname(f.originalname).toLowerCase()}`);
+      await fsp.rename(f.path, filePath);
       savedFiles.push({ path: filePath, baseName: path.basename(f.originalname, path.extname(f.originalname)) });
     }
+    accepted = true;
 
     const job = {
       id: jobId,
@@ -261,6 +312,8 @@ app.post('/api/jobs', submitLimiter, upload.array('files'), async (req, res) => 
       error: null,
       zipPath: null,
       createdAt: Date.now(),
+      lastSeen: Date.now(),
+      cancelled: false,
       finishedAt: null,
       params: { files: savedFiles, mode, lang, effectivePreset, wantTexture, titles },
     };
@@ -272,13 +325,31 @@ app.post('/api/jobs', submitLimiter, upload.array('files'), async (req, res) => 
   } catch (err) {
     console.error('job create error:', err.message);
     res.status(500).json({ error: 'Не вдалося прийняти файли. Спробуй ще раз.' });
+  } finally {
+    if (!accepted) await discardFiles(files); // будь-який відхилений запит не залишає файлів на диску
   }
 });
 
 app.get('/api/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Завдання не знайдено (можливо, вже застаріло)' });
+  job.lastSeen = Date.now();
   res.json(publicStatus(job));
+});
+
+// Скасування: з черги прибираємо одразу, а якщо вже обробляється — зупиняємось між треками.
+app.delete('/api/jobs/:id', (req, res) => {
+  const job = jobs.get(req.params.id);
+  if (!job) return res.json({ ok: true });
+  job.cancelled = true;
+  if (job.status === 'queued') {
+    const idx = queue.indexOf(job.id);
+    if (idx !== -1) queue.splice(idx, 1);
+    cleanupJob(job);
+  } else if (job.status === 'done' || job.status === 'error') {
+    cleanupJob(job);
+  } // 'processing' — pump() сам прибере після зупинки
+  res.json({ ok: true });
 });
 
 app.get('/api/jobs/:id/download', (req, res) => {
