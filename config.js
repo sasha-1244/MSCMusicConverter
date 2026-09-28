@@ -11,8 +11,10 @@ module.exports = {
 
   limits: {
     freeMaxFiles: 10,
-    premiumMaxFiles: 200,
+    premiumMaxFiles: 40,
     maxFileSizeMb: 60,
+    maxTotalMb: 250, // сумарний розмір всіх файлів одного завдання
+    abandonedQueueMs: 3 * 60 * 1000, // скільки завдання в черзі може не опитуватись (вкладку закрили), перш ніж його викинуть
     allowedExt: ['mp3', 'wav', 'flac', 'm4a', 'aac', 'ogg'],
     ffmpegTimeoutMs: 60_000, // ліміт на конвертацію одного файлу
     ffmpegConcurrency: 1, // скільки треків ОДНОГО завдання конвертувати одночасно — на слабкому Free CPU більше 1 тільки шкодить
