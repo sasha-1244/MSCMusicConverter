@@ -156,7 +156,8 @@ async function runJob(job) {
     out.on('error', reject);
     archive.pipe(out);
 
-    const folderName = mode === 'radio' ? 'Radio' : 'Music';
+    // Одна тека = те, що треба скопіювати в гру: треки (+ coverart.png для Music-режиму).
+    const folderName = mode === 'radio' ? 'Radio' : 'CD1';
     oggPaths.forEach((p, i) => archive.file(p, { name: `${folderName}/track${i + 1}.ogg` }));
     archive.append(readme, { name: readmeName });
     archive.append(tracklist, { name: 'TRACKLIST.txt' });
@@ -164,7 +165,7 @@ async function runJob(job) {
     if (wantTexture) {
       generateTexture(trackNames, lang)
         .then((texture) => {
-          archive.append(texture, { name: 'Textures/texture.png' });
+          archive.append(texture, { name: `${folderName}/coverart.png` });
           archive.finalize();
         })
         .catch(reject);
@@ -178,9 +179,15 @@ async function runJob(job) {
 
 function buildReadme(mode, trackNames, preset, hasTextures, lang) {
   const s = forLang(lang);
-  const lines = [...(mode === 'radio' ? s.radioIntro : s.musicIntro)];
-  if (mode === 'music' && hasTextures) lines.push(s.musicTexLine);
-  lines.push(...(mode === 'radio' ? s.radioOutro : s.musicOutro));
+  const radio = mode === 'radio';
+  const steps = radio
+    ? [s.steamStep, s.radioCopyStep, s.importStep, s.radioPlayStep]
+    : [s.steamStep, s.musicCopyStep, ...(hasTextures ? [s.musicTexStep] : []), s.importStep, s.musicPlayStep];
+  const lines = [radio ? 'MSC MUSIC PACK — RADIO' : 'MSC MUSIC PACK — MUSIC', '', radio ? s.radioDesc : s.musicDesc, ''];
+  steps.forEach((step, i) => lines.push(`${i + 1}. ${step}`));
+  lines.push('');
+  if (!radio) lines.push(s.musicNote);
+  lines.push(s.tracklistNote);
   lines.push('', `${s.trackCount} ${trackNames.length}`, `${s.procLabel} ${preset}`, '', s.generatedBy);
   return lines.join('\n');
 }
