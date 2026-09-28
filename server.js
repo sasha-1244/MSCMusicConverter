@@ -162,6 +162,7 @@ function buildReadme(mode, trackNames, preset, hasTextures, lang) {
   const s = forLang(lang);
   const lines = [...(mode === 'radio' ? s.radioIntro : s.musicIntro)];
   if (mode === 'music' && hasTextures) lines.push(s.musicTexLine);
+  lines.push(...(mode === 'radio' ? s.radioOutro : s.musicOutro));
   lines.push('', `${s.trackCount} ${trackNames.length}`, `${s.procLabel} ${preset}`, '', s.generatedBy);
   return lines.join('\n');
 }
